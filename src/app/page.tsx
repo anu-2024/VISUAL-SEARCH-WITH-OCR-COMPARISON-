@@ -105,8 +105,8 @@ export default function Home() {
             </h1>
             <p className="text-[var(--text-secondary)]">
               Upload an image to run{" "}
-              <span className="font-medium text-[var(--foreground)]">Tesseract.js</span> and{" "}
-              <span className="font-medium text-[var(--foreground)]">TrOCR</span> simultaneously —
+              <span className="font-medium text-[var(--foreground)]">TrOCR</span> and{" "}
+              <span className="font-medium text-[var(--foreground)]">Tesseract.js</span> simultaneously —
               compare speed, accuracy, and detected text side-by-side
             </p>
           </div>
@@ -115,11 +115,11 @@ export default function Home() {
           <div className="flex justify-center gap-3 flex-wrap">
             <div className="flex items-center gap-2 px-3 py-1.5 bg-[var(--surface)] border border-[var(--border)] rounded-full text-xs font-medium">
               <span className="w-2 h-2 rounded-full bg-blue-500" />
-              Tesseract.js · Classic LSTM
+              TrOCR · Vision Transformer
             </div>
             <div className="flex items-center gap-2 px-3 py-1.5 bg-[var(--surface)] border border-[var(--border)] rounded-full text-xs font-medium">
               <span className="w-2 h-2 rounded-full bg-purple-500" />
-              TrOCR · Vision Transformer
+              Tesseract.js · Classic LSTM
             </div>
           </div>
 
@@ -196,8 +196,8 @@ export default function Home() {
         {/* Live engine status pills in header */}
         {(isAnalyzing || results) && (
           <div className="flex gap-2">
-            <HeaderStatusPill label="Tesseract" status={ocrStatus.tesseract} color="blue" />
-            <HeaderStatusPill label="TrOCR" status={ocrStatus.trocr} color="purple" />
+            <HeaderStatusPill label="TrOCR" status={ocrStatus.tesseract} color="blue" />
+            <HeaderStatusPill label="Tesseract" status={ocrStatus.trocr} color="purple" />
           </div>
         )}
       </header>

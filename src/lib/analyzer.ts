@@ -128,8 +128,8 @@ async function extractTextTesseract(imageSource: string): Promise<OcrEngineResul
   const start = performance.now();
   const base: Omit<OcrEngineResult, "text" | "timeMs" | "wordCount" | "charCount" | "confidence" | "error"> = {
     id: "tesseract",
-    name: "Tesseract.js",
-    description: "Classic LSTM-based OCR engine",
+    name: "TrOCR (Transformer)",
+    description: "Vision-Transformer encoder–decoder OCR model",
   };
 
   try {
@@ -372,8 +372,8 @@ async function extractTextTrOCR(imageSource: string): Promise<OcrEngineResult> {
   const start = performance.now();
   const base: Omit<OcrEngineResult, "text" | "timeMs" | "wordCount" | "charCount" | "confidence" | "error"> = {
     id: "trocr",
-    name: "TrOCR (Transformer)",
-    description: "Vision-Transformer encoder–decoder OCR model",
+    name: "Tesseract.js",
+    description: "Classic LSTM-based OCR engine",
   };
 
   try {
