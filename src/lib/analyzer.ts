@@ -412,7 +412,7 @@ async function loadTrOCR(): Promise<ImageToTextPipeline> {
   trocrLoadPromise = (async () => {
     const { pipeline } = await import("@huggingface/transformers");
     const extractor = await pipeline("image-to-text", TROCR_MODEL_ID, {
-      dtype: "q8",
+      dtype: "fp16",
     });
     trocrPipeline = extractor;
     return extractor;
