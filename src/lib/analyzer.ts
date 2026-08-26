@@ -5,274 +5,6 @@ import Tesseract from "tesseract.js";
 import type { ImageToTextPipeline } from "@huggingface/transformers";
 import { AnalysisResult, Label, OcrEngineResult, SearchResult } from "@/types";
 
-// ─── Image Preprocessing Utilities ───────────────────────────────────────────
-// TrOCR expects clean, high-contrast, single-line text images.
-// We provide two strategies and pick whichever gives better output.
-
-/** Convert to grayscale using luminance weights. */
-function toGrayscale(imageData: ImageData): ImageData {
-  const d = imageData.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const gray = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-    d[i] = gray;
-    d[i + 1] = gray;
-    d[i + 2] = gray;
-  }
-  return imageData;
-}
-
-/** Otsu's method: compute optimal threshold for binarization. */
-function otsuThreshold(imageData: ImageData): number {
-  const hist = new Array(256).fill(0);
-  const d = imageData.data;
-  const total = d.length / 4;
-  for (let i = 0; i < d.length; i += 4) hist[d[i]]++;
-
-  let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * hist[i];
-
-  let sumB = 0;
-  let wB = 0;
-  let maxVariance = 0;
-  let threshold = 128;
-
-  for (let i = 0; i < 256; i++) {
-    wB += hist[i];
-    if (wB === 0) continue;
-    const wF = total - wB;
-    if (wF === 0) break;
-    sumB += i * hist[i];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const variance = wB * wF * (mB - mF) * (mB - mF);
-    if (variance > maxVariance) {
-      maxVariance = variance;
-      threshold = i;
-    }
-  }
-  return threshold;
-}
-
-/** Apply Otsu binarization. */
-function binarize(imageData: ImageData): ImageData {
-  const threshold = otsuThreshold(imageData);
-  const d = imageData.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const v = d[i] >= threshold ? 255 : 0;
-    d[i] = v;
-    d[i + 1] = v;
-    d[i + 2] = v;
-  }
-  return imageData;
-}
-
-/** Simple 3x3 sharpen convolution. */
-function sharpen(imageData: ImageData): ImageData {
-  const w = imageData.width;
-  const h = imageData.height;
-  const src = new Uint8ClampedArray(imageData.data);
-  const dst = imageData.data;
-  const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      for (let c = 0; c < 3; c++) {
-        let val = 0;
-        for (let ky = -1; ky <= 1; ky++) {
-          for (let kx = -1; kx <= 1; kx++) {
-            const idx = ((y + ky) * w + (x + kx)) * 4 + c;
-            val += src[idx] * kernel[(ky + 1) * 3 + (kx + 1)];
-          }
-        }
-        dst[(y * w + x) * 4 + c] = Math.min(255, Math.max(0, val));
-      }
-    }
-  }
-  return imageData;
-}
-
-/** Contrast-limited adaptive histogram stretch. */
-function stretchContrast(imageData: ImageData): ImageData {
-  const d = imageData.data;
-  const n = d.length / 4;
-  // Clip 2% from each end of histogram
-  const hist = new Array(256).fill(0);
-  for (let i = 0; i < d.length; i += 4) hist[d[i]]++;
-  const clip = Math.floor(n * 0.02);
-  let lo = 0, hi = 255, count = 0;
-  for (let i = 0; i < 256; i++) { count += hist[i]; if (count >= clip) { lo = i; break; } }
-  count = 0;
-  for (let i = 255; i >= 0; i--) { count += hist[i]; if (count >= clip) { hi = i; break; } }
-  if (hi <= lo) return imageData;
-  const range = hi - lo;
-  for (let i = 0; i < d.length; i += 4) {
-    for (let c = 0; c < 3; c++) {
-      d[i + c] = Math.max(0, Math.min(255, Math.round(((d[i + c] - lo) / range) * 255)));
-    }
-  }
-  return imageData;
-}
-
-// ─── Preprocessing Strategies ────────────────────────────────────────────────
-// Strategy A: Full binarize (best for noisy/low-contrast photos)
-// Strategy B: Contrast stretch + sharpen (best for clean/high-contrast images)
-// We try both and pick whichever TrOCR rates higher.
-
-type PreprocessResult = { dataUrl: string; strategy: string };
-
-function canvasToDataUrl(canvas: HTMLCanvasElement): string {
-  return canvas.toDataURL("image/png");
-}
-
-function loadImage(source: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Failed to load image"));
-    img.src = source;
-  });
-}
-
-function drawToCanvas(
-  img: HTMLImageElement,
-  targetWidth: number
-): HTMLCanvasElement {
-  const scale = targetWidth / img.naturalWidth;
-  const w = targetWidth;
-  const h = Math.max(1, Math.round(img.naturalHeight * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, w, h);
-  ctx.drawImage(img, 0, 0, w, h);
-  return canvas;
-}
-
-function addPadding(canvas: HTMLCanvasElement, pad: number): HTMLCanvasElement {
-  const padded = document.createElement("canvas");
-  padded.width = canvas.width + pad * 2;
-  padded.height = canvas.height + pad * 2;
-  const ctx = padded.getContext("2d")!;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, padded.width, padded.height);
-  ctx.drawImage(canvas, pad, pad);
-  return padded;
-}
-
-/** Strategy A: grayscale → sharpen → binarize → pad */
-async function preprocessBinarized(
-  img: HTMLImageElement,
-  targetWidth: number
-): Promise<PreprocessResult> {
-  const canvas = drawToCanvas(img, targetWidth);
-  const ctx = canvas.getContext("2d")!;
-  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  imageData = toGrayscale(imageData);
-  imageData = sharpen(imageData);
-  imageData = binarize(imageData);
-  ctx.putImageData(imageData, 0, 0);
-  return { dataUrl: canvasToDataUrl(addPadding(canvas, 20)), strategy: "binarized" };
-}
-
-/** Strategy B: grayscale → contrast stretch → sharpen → pad */
-async function preprocessContrast(
-  img: HTMLImageElement,
-  targetWidth: number
-): Promise<PreprocessResult> {
-  const canvas = drawToCanvas(img, targetWidth);
-  const ctx = canvas.getContext("2d")!;
-  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  imageData = toGrayscale(imageData);
-  imageData = stretchContrast(imageData);
-  imageData = sharpen(imageData);
-  ctx.putImageData(imageData, 0, 0);
-  return { dataUrl: canvasToDataUrl(addPadding(canvas, 20)), strategy: "contrast" };
-}
-
-// ─── Text Line Segmentation ──────────────────────────────────────────────────
-// TrOCR processes one line at a time. This splits multi-line regions into
-// individual lines using horizontal projection profiling.
-
-function segmentTextLines(
-  imageSource: string
-): Promise<string[]> {
-  return new Promise((resolve) => {
-    loadImage(imageSource)
-      .then((img) => {
-        const w = img.naturalWidth;
-        const h = img.naturalHeight;
-        const canvas = drawToCanvas(img, w);
-        const ctx = canvas.getContext("2d")!;
-        const imageData = ctx.getImageData(0, 0, w, h);
-        const gray = toGrayscale(new ImageData(new Uint8ClampedArray(imageData.data), w, h));
-        const bin = binarize(gray);
-        const d = bin.data;
-
-        // Horizontal projection: sum dark pixels per row
-        const projection = new Array(h).fill(0);
-        for (let y = 0; y < h; y++) {
-          for (let x = 0; x < w; x++) {
-            if (d[(y * w + x) * 4] === 0) projection[y]++;
-          }
-        }
-
-        // Find line bands (rows with above-threshold dark pixels)
-        const threshold = w * 0.01;
-        const lines: { start: number; end: number }[] = [];
-        let inLine = false;
-        let lineStart = 0;
-
-        for (let y = 0; y < h; y++) {
-          if (!inLine && projection[y] > threshold) {
-            inLine = true;
-            lineStart = y;
-          } else if (inLine && projection[y] <= threshold) {
-            inLine = false;
-            lines.push({ start: lineStart, end: y });
-          }
-        }
-        if (inLine) lines.push({ start: lineStart, end: h });
-
-        // Merge lines too close together (< 8px gap = same line)
-        const merged: { start: number; end: number }[] = [];
-        for (const line of lines) {
-          if (merged.length > 0 && line.start - merged[merged.length - 1].end < 8) {
-            merged[merged.length - 1].end = line.end;
-          } else {
-            merged.push({ ...line });
-          }
-        }
-
-        // Need at least 2 lines to segment; otherwise return the whole image
-        if (merged.length < 2) {
-          resolve([imageSource]);
-          return;
-        }
-
-        // Crop each line with padding
-        const pad = 10;
-        const croppedLines = merged.map((line) => {
-          const cropY = Math.max(0, line.start - pad);
-          const cropH = Math.min(h, line.end + pad) - cropY;
-          const lineCanvas = document.createElement("canvas");
-          lineCanvas.width = w;
-          lineCanvas.height = cropH;
-          const lCtx = lineCanvas.getContext("2d")!;
-          lCtx.fillStyle = "#ffffff";
-          lCtx.fillRect(0, 0, w, cropH);
-          lCtx.drawImage(img, 0, cropY, w, cropH, 0, 0, w, cropH);
-          return canvasToDataUrl(lineCanvas);
-        });
-
-        resolve(croppedLines);
-      })
-      .catch(() => resolve([imageSource]));
-  });
-}
-
 let model: mobilenet.MobileNet | null = null;
 let modelLoading = false;
 let modelLoadPromise: Promise<mobilenet.MobileNet> | null = null;
@@ -443,12 +175,12 @@ async function extractTextTesseract(imageSource: string): Promise<OcrEngineResul
 
 // ---------------------------------------------------------------------------
 // OCR Engine 2: TrOCR — transformer-based OCR (ViT encoder + text decoder)
-// Uses trocr-base-printed (333M params). Runs dual preprocessing strategies
-// (binarized vs contrast-stretched) and picks the best result per line.
-// Cross-validates against Tesseract output for final primary text selection.
+// Hybrid approach: Tesseract detects text lines → TrOCR recognizes each line.
+// This leverages Tesseract's superior layout analysis + TrOCR's superior
+// character recognition. Also tries raw image directly for single-line images.
 // ---------------------------------------------------------------------------
 
-const TROCR_MODEL_ID = "Xenova/trocr-base-printed";
+const TROCR_MODEL_ID = "Xenova/trocr-small-printed";
 
 let trocrPipeline: ImageToTextPipeline | null = null;
 let trocrLoadPromise: Promise<ImageToTextPipeline> | null = null;
@@ -460,7 +192,7 @@ async function loadTrOCR(): Promise<ImageToTextPipeline> {
   trocrLoadPromise = (async () => {
     const { pipeline } = await import("@huggingface/transformers");
     const extractor = await pipeline("image-to-text", TROCR_MODEL_ID, {
-      dtype: "fp16",
+      dtype: "q8",
     });
     trocrPipeline = extractor;
     return extractor;
@@ -529,35 +261,111 @@ function scoreTextQuality(text: string): number {
 function estimateTrOCRConfidence(text: string | null): number {
   if (!text || text.length === 0) return -1;
   const q = scoreTextQuality(text);
-  // Map quality score 0–100 to confidence 10–95
   return Math.max(10, Math.min(95, Math.round(50 + q * 0.45)));
 }
 
-/** Choose the better of two texts from different preprocessing strategies. */
-function pickBetterText(a: string, b: string): string {
-  const sa = scoreTextQuality(a);
-  const sb = scoreTextQuality(b);
-  if (sb > sa) return b;
-  return a;
+/**
+ * Use Tesseract's word-level bounding boxes to crop individual lines,
+ * then run TrOCR on each crop. This gives TrOCR exactly what it needs:
+ * clean, single-line text images.
+ */
+async function trocrWithTesseractCrops(
+  extractor: ImageToTextPipeline,
+  imageSource: string
+): Promise<string> {
+  const result = await Tesseract.recognize(imageSource, "eng", {
+    logger: () => {},
+  });
+
+  // Group Tesseract words into lines by their y-coordinate proximity
+  type TesseractWord = { bbox: { x0: number; y0: number; x1: number; y1: number } };
+  // Tesseract.js types omit `.words`; cast page data to access it.
+  const words: TesseractWord[] = (result.data as unknown as { words?: TesseractWord[] }).words ?? [];
+  if (words.length === 0) return "";
+
+  // Sort words by position: top-to-bottom, left-to-right
+  const sorted = [...words].sort((a, b) => {
+    const yDiff = a.bbox.y0 - b.bbox.y0;
+    return Math.abs(yDiff) > 15 ? yDiff : a.bbox.x0 - b.bbox.x0;
+  });
+
+  // Group into lines (words within 15px vertical distance)
+  const lines: { words: typeof sorted; bbox: { x0: number; y0: number; x1: number; y1: number } }[] = [];
+  let currentLine: typeof sorted = [];
+
+  for (const word of sorted) {
+    if (currentLine.length === 0) {
+      currentLine.push(word);
+      continue;
+    }
+    const lastY = currentLine[currentLine.length - 1].bbox.y0;
+    if (Math.abs(word.bbox.y0 - lastY) <= 15) {
+      currentLine.push(word);
+    } else {
+      lines.push({ words: currentLine, bbox: computeBBox(currentLine) });
+      currentLine = [word];
+    }
+  }
+  if (currentLine.length > 0) {
+    lines.push({ words: currentLine, bbox: computeBBox(currentLine) });
+  }
+
+  // Crop each line and run TrOCR
+  const lineTexts: string[] = [];
+  for (const line of lines) {
+    const { bbox } = line;
+    const pad = 8;
+    const cropCanvas = await cropRegion(imageSource, {
+      x: Math.max(0, bbox.x0 - pad),
+      y: Math.max(0, bbox.y0 - pad),
+      width: bbox.x1 - bbox.x0 + pad * 2,
+      height: bbox.y1 - bbox.y0 + pad * 2,
+    });
+    const text = await runTrOCRSingle(extractor, cropCanvas);
+    if (text.length > 0) lineTexts.push(text);
+  }
+
+  return lineTexts.join("\n");
 }
 
-/** Run TrOCR on a single line with dual preprocessing, return best text. */
-async function runTrOCRLine(
-  extractor: ImageToTextPipeline,
-  lineImage: string
+function computeBBox(
+  words: { bbox: { x0: number; y0: number; x1: number; y1: number } }[]
+): { x0: number; y0: number; x1: number; y1: number } {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const w of words) {
+    x0 = Math.min(x0, w.bbox.x0);
+    y0 = Math.min(y0, w.bbox.y0);
+    x1 = Math.max(x1, w.bbox.x1);
+    y1 = Math.max(y1, w.bbox.y1);
+  }
+  return { x0, y0, x1, y1 };
+}
+
+/** Crop a region from an image and return as data URL. */
+function cropRegion(
+  imageSource: string,
+  region: { x: number; y: number; width: number; height: number }
 ): Promise<string> {
-  const img = await loadImage(lineImage);
-
-  // Strategy A: binarized
-  const binarized = await preprocessBinarized(img, 384);
-  const textA = await runTrOCRSingle(extractor, binarized.dataUrl);
-
-  // Strategy B: contrast-stretched
-  const contrast = await preprocessContrast(img, 384);
-  const textB = await runTrOCRSingle(extractor, contrast.dataUrl);
-
-  // Pick whichever scored higher
-  return pickBetterText(textA, textB);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(region.width));
+      canvas.height = Math.max(1, Math.round(region.height));
+      const ctx = canvas.getContext("2d")!;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(
+        img,
+        region.x, region.y, region.width, region.height,
+        0, 0, canvas.width, canvas.height
+      );
+      resolve(canvas.toDataURL("image/png"));
+    };
+    img.onerror = () => resolve(imageSource);
+    img.src = imageSource;
+  });
 }
 
 async function extractTextTrOCR(imageSource: string): Promise<OcrEngineResult> {
@@ -565,24 +373,24 @@ async function extractTextTrOCR(imageSource: string): Promise<OcrEngineResult> {
   const base: Omit<OcrEngineResult, "text" | "timeMs" | "wordCount" | "charCount" | "confidence" | "error"> = {
     id: "trocr",
     name: "TrOCR (Transformer)",
-    description: "Vision-Transformer encoder–decoder OCR model (333M params)",
+    description: "Vision-Transformer encoder–decoder OCR model",
   };
 
   try {
     const extractor = await loadTrOCR();
 
-    // Segment image into text lines
-    const lines = await segmentTextLines(imageSource);
+    // Strategy 1: Send raw image directly (best for single-line images)
+    const rawText = await runTrOCRSingle(extractor, imageSource);
 
-    // Process each line with dual preprocessing, pick best
-    const lineTexts: string[] = [];
-    for (const lineImg of lines) {
-      const text = await runTrOCRLine(extractor, lineImg);
-      if (text.length > 0) lineTexts.push(text);
-    }
+    // Strategy 2: Use Tesseract to detect lines, then TrOCR to recognize each
+    const hybridText = await trocrWithTesseractCrops(extractor, imageSource);
 
-    const text = lineTexts.join("\n").trim();
-    const finalText = text.length > 0 ? text : null;
+    // Pick whichever got more/better text
+    const rawScore = scoreTextQuality(rawText);
+    const hybridScore = scoreTextQuality(hybridText);
+    const bestText = hybridScore >= rawScore ? hybridText : rawText;
+
+    const finalText = bestText.length > 0 ? bestText : null;
 
     const wordCount = finalText ? finalText.split(/\s+/).filter(Boolean).length : 0;
     const charCount = finalText ? finalText.replace(/\s/g, "").length : 0;
@@ -619,36 +427,13 @@ function pickPrimaryText(results: OcrEngineResult[]): string | null {
 
   if (!trocr || !tesseract) return candidates[0].text;
 
-  const trocrConf = trocr.confidence >= 0 ? trocr.confidence : 0;
-  const tessConf = tesseract.confidence >= 0 ? tesseract.confidence : 0;
-
-  // Cross-validation: check if the two engines agree on any words
-  const trocrWords = new Set(
-    (trocr.text ?? "").toLowerCase().split(/\s+/).filter(Boolean)
-  );
-  const tessWords = new Set(
-    (tesseract.text ?? "").toLowerCase().split(/\s+/).filter(Boolean)
-  );
-  let overlap = 0;
-  for (const w of trocrWords) if (tessWords.has(w)) overlap++;
-  const overlapRatio =
-    Math.max(trocrWords.size, tessWords.size) > 0
-      ? overlap / Math.max(trocrWords.size, tessWords.size)
-      : 0;
-
-  // If both agree (>50% word overlap), prefer TrOCR (more sophisticated model)
-  if (overlapRatio > 0.5) {
-    return trocrConf >= 40 ? trocr.text : tesseract.text;
+  // Prefer TrOCR whenever it produced meaningful output (>= 3 chars),
+  // since the hybrid pipeline already validates via Tesseract word crops.
+  if (trocr.wordCount >= 1 && (trocr.charCount ?? 0) >= 3) {
+    return trocr.text;
   }
 
-  // If they disagree significantly, use confidence-weighted quality
-  const trocrScore = trocrConf * Math.max(1, trocr.wordCount);
-  const tessScore = tessConf * Math.max(1, tesseract.wordCount);
-
-  // TrOCR gets a bonus (transformer model is generally more accurate)
-  const trocrBonus = 1.2;
-
-  return trocrScore * trocrBonus >= tessScore ? trocr.text : tesseract.text;
+  return tesseract.text;
 }
 
 function generateSearchResults(labels: Label[], textContent: string | null): SearchResult[] {

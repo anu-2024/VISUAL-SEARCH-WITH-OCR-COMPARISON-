@@ -119,7 +119,7 @@ export default function Home() {
             </div>
             <div className="flex items-center gap-2 px-3 py-1.5 bg-[var(--surface)] border border-[var(--border)] rounded-full text-xs font-medium">
               <span className="w-2 h-2 rounded-full bg-purple-500" />
-              TrOCR Base · Vision Transformer (333M)
+              TrOCR · Vision Transformer
             </div>
           </div>
 
